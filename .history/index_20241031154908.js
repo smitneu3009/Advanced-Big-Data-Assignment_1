@@ -5,7 +5,6 @@ const redisClient = require('./redisConnection');
 const planSchema = require('./schema'); 
 const dotenv = require('dotenv');
 const { OAuth2Client } = require('google-auth-library');
-const crypto = require('crypto'); // Import crypto for ETag hashing
 
 dotenv.config();  
 
@@ -15,7 +14,7 @@ const PORT = process.env.PORT || 3000;
 const API_VERSION = 'v1';
 
 // Google OAuth2 Client
-const CLIENT_ID = "690786630324-tktkfgsps7regkqqmu4vkp4mu5hukoao.apps.googleusercontent.com";
+const CLIENT_ID = process.env.CLIENT_ID;
 const oauthClient = new OAuth2Client(CLIENT_ID);
 
 // Middleware for token validation
@@ -41,15 +40,14 @@ async function verifyToken(req, res, next) {
 }
 
 app.use(bodyParser.json());
-
-// Helper function to generate ETag
-function generateETag(data) {
-  return crypto.createHash('sha1').update(data).digest('hex');
-}
-
 const validatePlan = ajv.compile(planSchema);
 
-/// POST (Create) Plan with Bearer Token Authentication
+// Helper to generate ETag
+function generateETag(data) {
+  return `"${Buffer.from(JSON.stringify(data)).toString('base64')}"`;
+}
+
+// POST (Create) Plan with ETag generation
 app.post(`/api/${API_VERSION}/plans`, verifyToken, async (req, res) => {
   const data = req.body;
   const isValid = validatePlan(data);
@@ -58,127 +56,110 @@ app.post(`/api/${API_VERSION}/plans`, verifyToken, async (req, res) => {
     return res.status(400).json({ errors: validatePlan.errors });
   }
 
-  const objectId = data.objectId;
+  const objectId = data.planCostShares.objectId;
 
   try {
     const existingPlan = await redisClient.get(objectId);
 
     if (existingPlan) {
-      // If the plan already exists, generate ETag for the existing data
-      const existingETag = generateETag(existingPlan);
-
-      // Set the ETag header with the existing ETag
-      res.set('ETag', existingETag);
-      
-      // Return the 409 Conflict response with the existing data and ETag
       return res.status(409).json({ message: "Conflict: Plan already exists", data: JSON.parse(existingPlan) });
     }
 
-    // If no conflict, save the new plan
-    await redisClient.set(objectId, JSON.stringify(data));
-
-    // Generate ETag for the new data and set the ETag header
-    const newETag = generateETag(JSON.stringify(data));
-    res.set('ETag', newETag);
-
-    res.status(201).json({ message: "Plan created", data });
+    const etag = generateETag(data);
+    await redisClient.set(objectId, JSON.stringify({ ...data, etag }));
+    res.set('ETag', etag);
+    res.status(201).json({ message: "Plan created", data, etag });
   } catch (err) {
     console.error('Error storing plan in Redis:', err);
     res.status(500).json({ error: 'Internal Server Error: Could not store plan' });
   }
 });
 
-
-// PUT (Replace) Plan
-app.put(`/api/${API_VERSION}/plans/:objectId`, verifyToken, async (req, res) => {
-  const { objectId } = req.params;
-  const newData = req.body;
-
-  if (!validatePlan(newData)) {
-    return res.status(400).json({ errors: validatePlan.errors });
-  }
-
-  try {
-    const existingPlan = await redisClient.get(objectId);
-    if (!existingPlan) {
-      return res.status(404).json({ message: "Not Found: Plan does not exist" });
-    }
-
-    const currentETag = generateETag(existingPlan);
-
-    if (req.headers['if-match'] !== currentETag) {
-      return res.status(412).json({ error: 'Precondition Failed: ETag does not match' });
-    }
-
-    await redisClient.set(objectId, JSON.stringify(newData));
-    const etag = generateETag(JSON.stringify(newData));
-    res.set('ETag', etag);
-    res.status(200).json({ message: "Plan replaced", data: newData });
-  } catch (err) {
-    console.error('Error replacing plan in Redis:', err);
-    res.status(500).json({ error: 'Internal Server Error: Could not replace plan' });
-  }
-});
-
-
-// PATCH (Update) Plan
-app.patch(`/api/${API_VERSION}/plans/:objectId`, verifyToken, async (req, res) => {
-  const { objectId } = req.params;
-  const updates = req.body;
-
-  try {
-    const plan = await redisClient.get(objectId);
-    if (!plan) {
-      return res.status(404).json({ message: "Not Found: Plan does not exist" });
-    }
-
-    const currentETag = generateETag(plan);
-    if (req.headers['if-match'] !== currentETag) {
-      return res.status(412).json({ error: 'Precondition Failed: ETag does not match' });
-    }
-
-    const planData = JSON.parse(plan);
-    const updatedPlan = { ...planData, ...updates };
-
-    if (!validatePlan(updatedPlan)) {
-      return res.status(400).json({ errors: validatePlan.errors });
-    }
-
-    await redisClient.set(objectId, JSON.stringify(updatedPlan));
-    const newETag = generateETag(JSON.stringify(updatedPlan)); // Generate new ETag
-    res.set('ETag', newETag); // Set new ETag in response header
-    res.status(200).json({ message: "Plan updated", data: updatedPlan });
-  } catch (err) {
-    console.error('Error updating plan in Redis:', err);
-    res.status(500).json({ error: 'Internal Server Error: Could not update plan' });
-  }
-});
-
-// GET Plan with updated ETag logic
+// GET (Read) Plan with ETag validation
 app.get(`/api/${API_VERSION}/plans/:objectId`, verifyToken, async (req, res) => {
   const { objectId } = req.params;
 
   try {
     const plan = await redisClient.get(objectId);
+
     if (!plan) {
       return res.status(404).json({ message: "Not Found: Plan not found" });
     }
 
-    const etag = generateETag(plan);
-    res.set('ETag', etag);
+    const parsedPlan = JSON.parse(plan);
+    const etag = parsedPlan.etag || generateETag(parsedPlan);
 
     if (req.headers['if-none-match'] === etag) {
       return res.status(304).end(); // Not Modified
     }
 
-    res.status(200).json(JSON.parse(plan));
+    res.set('ETag', etag);
+    res.status(200).json(parsedPlan);
   } catch (err) {
     console.error('Error reading plan from Redis:', err);
     res.status(500).json({ error: 'Internal Server Error: Could not retrieve plan' });
   }
 });
 
-// DELETE Plan without ETag validation
+// PUT (Replace) Plan with ETag generation
+app.put(`/api/${API_VERSION}/plans/:objectId`, verifyToken, async (req, res) => {
+  const { objectId } = req.params;
+  const data = req.body;
+  const isValid = validatePlan(data);
+
+  if (!isValid) {
+    return res.status(400).json({ errors: validatePlan.errors });
+  }
+
+  const etag = generateETag(data);
+
+  try {
+    const existingPlan = await redisClient.get(objectId);
+
+    if (!existingPlan) {
+      return res.status(404).json({ message: "Not Found: Plan does not exist" });
+    }
+
+    await redisClient.set(objectId, JSON.stringify({ ...data, etag }));
+    res.set('ETag', etag);
+    res.status(200).json({ message: "Plan replaced", data, etag });
+  } catch (err) {
+    console.error('Error replacing plan in Redis:', err);
+    res.status(500).json({ error: 'Internal Server Error: Could not replace plan' });
+  }
+});
+
+// PATCH (Update) Plan with ETag generation
+app.patch(`/api/${API_VERSION}/plans/:objectId`, verifyToken, async (req, res) => {
+  const { objectId } = req.params;
+  const updates = req.body;
+
+  try {
+    const plan = await redisClient.get(objectId);
+
+    if (!plan) {
+      return res.status(404).json({ message: "Not Found: Plan does not exist" });
+    }
+
+    const parsedPlan = JSON.parse(plan);
+    const updatedPlan = { ...parsedPlan, ...updates };
+    const isValid = validatePlan(updatedPlan);
+
+    if (!isValid) {
+      return res.status(400).json({ errors: validatePlan.errors });
+    }
+
+    const etag = generateETag(updatedPlan);
+    await redisClient.set(objectId, JSON.stringify({ ...updatedPlan, etag }));
+    res.set('ETag', etag);
+    res.status(200).json({ message: "Plan updated", data: updatedPlan, etag });
+  } catch (err) {
+    console.error('Error updating plan in Redis:', err);
+    res.status(500).json({ error: 'Internal Server Error: Could not update plan' });
+  }
+});
+
+// DELETE Plan with ETag validation
 app.delete(`/api/${API_VERSION}/plans/:objectId`, verifyToken, async (req, res) => {
   const { objectId } = req.params;
 
@@ -189,7 +170,13 @@ app.delete(`/api/${API_VERSION}/plans/:objectId`, verifyToken, async (req, res) 
       return res.status(404).json({ message: "Not Found: Plan not found" });
     }
 
-    // Delete the plan directly
+    const parsedPlan = JSON.parse(plan);
+    const etag = parsedPlan.etag;
+
+    if (req.headers['if-match'] && req.headers['if-match'] !== etag) {
+      return res.status(412).json({ message: "Precondition Failed: ETag does not match" });
+    }
+
     const deleted = await redisClient.del(objectId);
 
     if (deleted === 0) {
@@ -203,8 +190,6 @@ app.delete(`/api/${API_VERSION}/plans/:objectId`, verifyToken, async (req, res) 
   }
 });
 
-
-// Gracefully handle process termination
 process.on('SIGINT', async () => {
   console.log('Disconnecting Redis client...');
   await redisClient.quit();
